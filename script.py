@@ -15,12 +15,27 @@ s3 = boto3.client('s3')
 
 
 
-def get_files_to_download(bucket_name, prefix):
-    """List all files under the given S3 prefix."""
+def get_files_to_download(bucket_name, prefix, start_date=None, end_date=None, max_items=None):
+    """List files under the given S3 prefix filtered by date range and/or max items."""
     files = []
-    paginator = s3.get_paginator('list_objects_v2') 
+    paginator = s3.get_paginator('list_objects_v2')
+    count = 0
+
     for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-        files.extend(page.get('Contents', []))
+        for item in page.get('Contents', []):
+            last_modified = item['LastModified']
+            # Filter by date range if start_date or end_date is specified
+            if start_date and last_modified < datetime.strptime(start_date, '%Y-%m-%d'):
+                continue
+            if end_date and last_modified > datetime.strptime(end_date, '%Y-%m-%d'):
+                continue
+
+            files.append(item)
+            count += 1
+            # Stop if the maximum number of items is reached
+            if max_items and count >= max_items:
+                return files
+
     return files
 
 
@@ -73,12 +88,16 @@ def upload_to_s3(zip_path, bucket_name, destination_prefix, files):
     try:
         s3.upload_file(zip_path, bucket_name, destination_key, ExtraArgs={'StorageClass': 'DEEP_ARCHIVE'})
         print(f"Upload complete: s3://{bucket_name}/{destination_key}")
-        for file in files:
-            original_key = SOURCE_PREFIX + file[len(LOCAL_TEMP_DIR):]
-            s3.delete_object(Bucket=bucket_name, Key=original_key)
-            print(f"Deleted original file from S3: {original_key}")
+        delete_files_from_s3(bucket_name, files)
     except Exception as e:
         print(f"Upload failed: {e}")
+
+def delete_files_from_s3(bucket_name, files):
+    """Delete files in batch from S3."""
+    objects_to_delete = [{'Key': SOURCE_PREFIX + file[len(LOCAL_TEMP_DIR):]} for file in files]
+    response = s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects_to_delete})
+    deleted = response.get('Deleted', [])
+    print(f"Deleted {len(deleted)} files from S3.")
 
 def cleanup_local_files(files, zip_path):
     for file in files:
@@ -94,7 +113,7 @@ def cleanup_local_files(files, zip_path):
 
 def main():
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
-    files = get_files_to_download(BUCKET_NAME, SOURCE_PREFIX)
+    files = get_files_to_download(BUCKET_NAME, SOURCE_PREFIX, max_items=20000)
     print(f"Total files to download: {len(files)}")
     total_downloaded = 0
 
@@ -121,6 +140,8 @@ def main():
         total_downloaded += segment_size
         files = files[len(segment_files):]
         print(f"Segment completed: {zip_name} ({segment_size / 1e9:.2f} GB)")
+        # uncomment to process only one segment
+        # break
 
     print(f"All files processed. Total downloaded: {total_downloaded / 1e9:.2f} GB")
 
