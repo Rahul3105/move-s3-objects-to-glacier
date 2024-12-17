@@ -94,10 +94,14 @@ def upload_to_s3(zip_path, bucket_name, destination_prefix, files):
 
 def delete_files_from_s3(bucket_name, files):
     """Delete files in batch from S3."""
-    objects_to_delete = [{'Key': SOURCE_PREFIX + file[len(LOCAL_TEMP_DIR):]} for file in files]
-    response = s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects_to_delete})
-    deleted = response.get('Deleted', [])
-    print(f"Deleted {len(deleted)} files from S3.")
+    # Do it in batches of 1000 files to avoid exceeding the limit
+    batch_size = 1000
+    for i in range(0, len(files), batch_size):
+        batch_files = files[i:i+batch_size]
+        objects_to_delete = [{'Key': SOURCE_PREFIX + file[len(LOCAL_TEMP_DIR):]} for file in batch_files]
+        response = s3.delete_objects(Bucket=bucket_name, Delete={'Objects': objects_to_delete})
+        deleted = response.get('Deleted', [])
+        print(f"Deleted {len(deleted)} files from S3.")
 
 def cleanup_local_files(files, zip_path):
     for file in files:
