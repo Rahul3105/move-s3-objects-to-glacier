@@ -1,7 +1,11 @@
+import json
 import boto3
 import os
 import zipfile
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pymongo  # Import pymongo to work with MongoDB
+from bson import ObjectId
 
 # Configuration
 BUCKET_NAME = 'assess-platform-prod-user-data'
@@ -13,63 +17,68 @@ SEGMENT_SIZE = 10 * 1024 * 1024 * 1024  # 1GB in bytes
 # Initialize S3 client pass region and key and secret as well
 s3 = boto3.client('s3')
 
+def update_history_file(first_id, last_id, total):
+    """Update or create history.json file with new IDs."""
+    history_path = 'history.json'
+    try:
+        # Try to open the history file if it exists
+        with open(history_path, 'r') as file:
+            history_data = json.load(file)
+    except FileNotFoundError:
+        # If the file does not exist, start a new list
+        history_data = []
+
+    # Convert ObjectId to string and append new object with first_id and last_id
+    history_data.append({'first_id': str(first_id), 'last_id': str(last_id), 'total':total})
+
+    # Write the updated history back to the file
+    with open(history_path, 'w') as file:
+        json.dump(history_data, file, indent=4)
+
+    print(f"Updated history file with first_id: {first_id} and last_id: {last_id}")
 
 
-def get_files_to_download(bucket_name, prefix, start_date=None, end_date=None, max_items=None):
-    """List files under the given S3 prefix filtered by date range and/or max items."""
+
+def get_files_to_download(bucket_name, prefixes):
+    """List files under the given S3 prefixes."""
     files = []
     paginator = s3.get_paginator('list_objects_v2')
-    count = 0
-
-    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
-        for item in page.get('Contents', []):
-            last_modified = item['LastModified']
-            # Filter by date range if start_date or end_date is specified
-            if start_date and last_modified < datetime.strptime(start_date, '%Y-%m-%d'):
-                continue
-            if end_date and last_modified > datetime.strptime(end_date, '%Y-%m-%d'):
-                continue
-
-            files.append(item)
-            count += 1
-            # Stop if the maximum number of items is reached
-            if max_items and count >= max_items:
-                return files
+    
+    for prefix in prefixes:  # Iterate over each prefix in the array
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+            for item in page.get('Contents', []):
+                files.append(item)
 
     return files
 
 
-def download_segment(files, local_dir, target_size):
-    """Download files until the target size is reached, preserving directory structure."""
+
+
+def download_segment(files, local_dir):
+    """Download files until the target size is reached, preserving directory structure, using concurrent downloads."""
     total_size = 0
     downloaded_files = []
-    date_range = [None, None]
     print(f"Downloading segment...")
-    for file in files:
+
+    # Function to download a single file
+    def download_file(file):
         key = file['Key']
         size = file['Size']
-        last_modified = file['LastModified']
-
-        if total_size + size > target_size:
-            break
-
-        # Preserve directory structure
-        local_path = os.path.join(local_dir, key[len(SOURCE_PREFIX):])  # Adjust path to include subdirectories
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)  # Create directories as needed
-
-        # Download file
+        local_path = os.path.join(local_dir, key[len(SOURCE_PREFIX):])
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
         s3.download_file(BUCKET_NAME, key, local_path)
+        return local_path, size
 
-        # Update size, range, and tracking
-        total_size += size
-        downloaded_files.append(local_path)
-        if not date_range[0] or last_modified < date_range[0]:
-            date_range[0] = last_modified
-        if not date_range[1] or last_modified > date_range[1]:
-            date_range[1] = last_modified
+    # Using ThreadPoolExecutor to download files concurrently
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_file = {executor.submit(download_file, file): file for file in files}
+        for future in as_completed(future_to_file):
+            local_path, size = future.result()
+            total_size += size
+            downloaded_files.append(local_path)
 
     print(f"Segment size: {total_size / 1e9:.2f} GB")
-    return downloaded_files, total_size, date_range
+    return downloaded_files, total_size
 
 def compress_files(files, output_zip):
     """Compress a list of files into a ZIP archive, preserving directory structure."""
@@ -117,35 +126,65 @@ def cleanup_local_files(files, zip_path):
 
 def main():
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
-    files = get_files_to_download(BUCKET_NAME, SOURCE_PREFIX, max_items=20000)
-    print(f"Total files to download: {len(files)}")
     total_downloaded = 0
 
-    while files:
-        # Download segment
-        segment_files, segment_size, date_range = download_segment(files, LOCAL_TEMP_DIR, SEGMENT_SIZE)
-        if not segment_files:
-            break
 
-        # Determine ZIP file name
-        start_date = date_range[0].strftime('%Y-%m-%d')
-        end_date = date_range[1].strftime('%Y-%m-%d')
-        zip_name = f"{start_date}_to_{end_date}.zip"
-        zip_path = os.path.join(LOCAL_TEMP_DIR, zip_name)
+    client = pymongo.MongoClient("mongodb+srv://Amanullah:7q8cxiYuxV7ppAoA@assess-prod-dedicated.em5zz.mongodb.net/assess-production?readPreference=secondary")
+    db = client.get_database("assess-production")
+    
+    proctoringmedias = db.get_collection("proctoringmedias")
+    # fetch history.json file if exists pick last object and get last_id
+    try:
+        with open('history.json', 'r') as file:
+            history_data = json.load(file)
+            first_id = history_data[-1]['last_id']
+            print(f"Retrieved last_id from history file: {first_id}")
+    except FileNotFoundError:
+        print("No history file found, starting from the beginning.")
+        first_id = None
+    
+    print(f"{first_id} is the first_id")
+    findQuery = {"_id": {"$gt": ObjectId(first_id)}} if first_id else {}  # If first_id is None
+    print(f"Query: {findQuery}")
+    proctoring_medias = list(proctoringmedias.find(findQuery, {'singleAssessmentUser': 1}).sort({"_id":1}).limit(1000))
+    
+    print(f"Retrieved {len(proctoring_medias)} user documents")
+    if(len(proctoring_medias) == 0):
+        print("No new documents found, exiting.")
+        return
+    update_history_file(proctoring_medias[0]['_id'], proctoring_medias[-1]['_id'], total=len(proctoring_medias))    
+    
+    source_prefixes = [f"proctoring/images/camera/u/{proctoring_media['singleAssessmentUser']}/" for proctoring_media in proctoring_medias]
+    print(f"Source prefixes: {source_prefixes}")
+    files = get_files_to_download(BUCKET_NAME, source_prefixes)
+    print(f"Total files to download: {len(files)}")
+    
+    zip_file_name = f"{proctoring_medias[0]['_id']}-{proctoring_medias[-1]['_id']}.zip" # Use the first and last document IDs as the ZIP file name
+    print(f"Starting download and upload process...")
+    
+    segment_files, segment_size = download_segment(files, LOCAL_TEMP_DIR)
+    if not segment_files:
+        print("No files to download, exiting.")
+        return
+    
+    # Determine ZIP file name
+    # zip_name = f"{"some"}_to_{"some"}.zip"
+    
+    zip_path = os.path.join(LOCAL_TEMP_DIR, zip_file_name)
 
-        # Compress and upload
-        compress_files(segment_files, zip_path)
-        upload_to_s3(zip_path, BUCKET_NAME, DESTINATION_PREFIX, segment_files)
+    # Compress and upload
+    compress_files(segment_files, zip_path)
+    upload_to_s3(zip_path, BUCKET_NAME, DESTINATION_PREFIX, segment_files)
 
-        # Cleanup
-        cleanup_local_files(segment_files, zip_path)
+    # Cleanup
+    cleanup_local_files(segment_files, zip_path)
 
-        # Update progress and remaining files
-        total_downloaded += segment_size
-        files = files[len(segment_files):]
-        print(f"Segment completed: {zip_name} ({segment_size / 1e9:.2f} GB)")
-        # uncomment to process only one segment
-        # break
+    # Update progress and remaining files
+    total_downloaded += segment_size
+    files = files[len(segment_files):]
+    print(f"Segment completed: {zip_file_name} ({segment_size / 1e9:.2f} GB)")
+    # uncomment to process only one segment
+    # break
 
     print(f"All files processed. Total downloaded: {total_downloaded / 1e9:.2f} GB")
 
